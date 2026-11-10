@@ -112,7 +112,7 @@ Todo 写入后，Runtime 读回会话 JSON 核查。确认已写入时可以继�
 
 除最小可用 Agent 实现外，笔试还包含五个独立架构设计问题：
 
-[查看五道架构设计题解](docs/architecture-questions.md)
+[查看五道架构设计题解](ARCHITECTURE-DESIGN-ANSWERS.md)
 
 ## 文档索引
 
