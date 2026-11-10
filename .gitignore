@@ -1,0 +1,28 @@
+# ---- 密钥与本地环境 ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 运行时数据（Session / 日志 / 临时文件）----
+sessions/
+/logs/
+*.log
+*.tmp
+*.bak
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
