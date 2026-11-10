@@ -9,6 +9,7 @@ from typing import Any, Literal, TypedDict
 
 from agent_harness.model import Model, ModelError
 from agent_harness.tools import ToolManager, ToolResult
+from agent_harness.tools.registry import TOOL_STATE_UNCERTAIN
 
 _MAX_DECISIONS = 8
 _API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{12,}")
@@ -37,6 +38,8 @@ def _log_tool_result(
         value = data.get("value")
         if type(value) in (int, float):
             summary["value"] = value
+        if data.get("recovered") is True:
+            summary["recovered"] = True
         event["result_summary"] = summary
     else:
         event["error_code"] = result["error"]["code"]
@@ -74,19 +77,26 @@ class Runtime:
                 }
 
             messages.append(decision["assistant_message"])
+            uncertain = False
             for call in decision["tool_calls"]:
                 call_id = call["tool_call_id"]
                 name = call["name"]
-                if turn == _MAX_DECISIONS:
-                    # 预算已耗尽，没有下一轮模型请求可以接收工具结果。
+                if uncertain:
                     started = False
                     result: ToolResult = {
+                        "ok": False,
+                        "error": {"code": "tool_skipped", "message": "前一工具的状态无法核实。"},
+                    }
+                elif turn == _MAX_DECISIONS:
+                    # 预算已耗尽，没有下一轮模型请求可以接收工具结果。
+                    started = False
+                    result = {
                         "ok": False,
                         "error": {"code": "limit_reached", "message": "模型决策预算已耗尽。"},
                     }
                 else:
                     started, result = self._tools.execute_with_start_status(
-                        name, call["arguments"]
+                        name, call["arguments"], session_id=session_id
                     )
                 started_count += started
                 _log_tool_result(session_id, call_id, name, started, result)
@@ -95,6 +105,15 @@ class Runtime:
                     "tool_call_id": call_id,
                     "content": json.dumps(result, allow_nan=False),
                 })
+                if not result["ok"] and result["error"]["code"] == TOOL_STATE_UNCERTAIN:
+                    uncertain = True
+
+            if uncertain:
+                return {
+                    "session_id": session_id,
+                    "answer": "工具写入状态无法核实，已停止本次请求。此前的操作未回滚。",
+                    "status": "failed",
+                }
 
         return {
             "session_id": session_id,

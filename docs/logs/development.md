@@ -72,3 +72,21 @@
 - **验收状态**。T04 DoD 已取得本地与真实闭环验证证据，待独立 Code Review。
 - **最终验收**。独立 Code Review 已通过，项目负责人批准 T04 收尾。
 - **剩余风险**。Trace 目前由调用方启用 INFO 日志接收，尚未持久化到文件（完整 Trace 留待 T09）；会话历史仅存在于单次请求的 Messages 内，跨轮记忆与 Session 恢复留待 T05–T07；真实闭环验证仅覆盖 Calculator，Mock Search 及多工具连用的真实端到端验证留待后续任务。
+
+## 2026-11-10（T05 Todo CRUD 与可信 Session 注入）
+
+- **起点与范围**。开始时 HEAD 为 `bccd895`，T04 已验收且改动仍在工作树。收尾核查时 T04 已有本地提交 `c78bcaf`，T05 改动仍在工作树。本轮保留 T04 的 Model 配置、预算规则和测试。
+- **内存存储与工具**。`TodoStore` 在单进程内按可信会话归属管理 `{id, content}`，用 UUID 分配稳定 ID。工具 `todo` 支持 `create`、`list`、`get`、`update`、`delete`。按 ID 操作同时校验记录的会话归属，跨会话和不存在的 ID 均返回 `todo_not_found`。注册方式为 `manager.register(create_todo_tool(store))`。
+- **可信注入**。Runtime 将 `session_id` 作为工具执行接口的独立关键字参数传入。Tool Manager 只向声明 `requires_session` 的 handler 注入。Todo Schema 无会话字段并拒绝额外参数。原有无状态工具调用方式及结果格式可继续使用。
+- **写入与重复保护**。同一会话中重复创建去除首尾空白后的相同活跃内容时，返回原 ID 和 `created=false`。更新到其他活跃记录的同一内容会被拒绝。存储在同一把锁下写入并核查异常后的目标状态，核实成功返回 `recovered=true`。无法确认的异常或非法工具结果返回 `tool_state_uncertain`，Runtime 跳过同批剩余调用并停止本次请求。模型失败或预算触顶保留已写入状态与 Trace。
+- **本地验证**。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，60 项全部通过，耗时 0.556 秒，退出码 0。新增 10 项，覆盖 CRUD、ID 和会话隔离、伪造会话参数、重复创建和 UUID 冲突、模型异常和预算后的状态，以及写后抛错与不可序列化结果。故障注入分别验证核实后复用原 ID 和无法核实时停止两条路径。
+- **真实 DeepSeek 闭环**。用 PowerShell `$probe | .\.venv\Scripts\python.exe -B -` 执行观察脚本，退出码 0。使用 `deepseek-flash`，合成提示要求先计算 `1+1`，收到 Calculator 结果后用 Todo 创建字符串内容为计算结果的待办，共三次模型决策。
+  - `calculator` 调用 ID `call_00_5uAoSGtq7eQ8yEuPmrqP0115`，参数 `{"expression":"1+1"}`，工具回填结果为 `2`。下一轮模型收到该工具消息后请求 `todo`。
+  - `todo` 调用 ID `call_00_fzerHCe8XybsV9GjM5B92331`，参数 `{"action":"create","content":"2"}`。两条 Trace 均关联 `t05-live-A`，同各自调用 ID，`started=true`、`ok=true`。
+  - `TodoStore.list("t05-live-A")` 实测返回 `[{"id":"27d0d9d80b10477db2f0e93053391bc7","content":"2"}]`，与回填的 Todo 结果一致。对照会话 `t05-live-B` 为空。Runtime 返回 `completed`，最终回答为 `Created todo 2`。
+- **T06 交接与限制**。复用可信会话标识与 `{id, content}` 记录结构。持久化存储需沿用会话范围内的 CRUD 接口和写后核查语义。当前状态只存在于同一个 TodoStore 实例，去重限于当前活跃的同内容记录。会话持久化、重启恢复与对话历史均留给各自任务。
+- **最终验收**。独立 Code Review 已通过，项目负责人批准 T05 收尾。本地复测 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，60 项全部通过（OK，退出码 0）。
+- **三个已知问题**：
+  1. **内存态无持久化**：Todo 状态只存在于单个 `TodoStore` 实例，进程重启即丢失；会话持久化与重启恢复留待 T06。
+  2. **去重仅限活跃记录**：`create` 去重只对当前未删除的同内容记录生效，删除后重建相同内容会生成新 ID。
+  3. **无跨轮对话历史**：每次请求的 `messages` 均由单条用户消息新建，Runtime 不保存历史，跨轮记忆留待 T06–T07。

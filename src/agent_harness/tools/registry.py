@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from math import isfinite
@@ -35,6 +35,7 @@ class ToolFailure(TypedDict):
 
 
 ToolResult = ToolSuccess | ToolFailure
+TOOL_STATE_UNCERTAIN = "tool_state_uncertain"
 
 
 class ToolError(Exception):
@@ -50,7 +51,8 @@ class ToolDefinition:
     name: str
     description: str
     parameters_schema: dict[str, Any]
-    handler: Callable[[Mapping[str, Any]], dict[str, Any]]
+    handler: Callable[..., dict[str, Any]]
+    requires_session: bool = False
 
 
 def _is_json_value(value: object) -> bool:
@@ -134,12 +136,16 @@ class ToolManager:
         """按注册顺序返回可直接序列化的公开定义。"""
         return [_public_definition(*entry) for entry in self._tools.values()]
 
-    def execute(self, name: str, arguments: object) -> ToolResult:
+    def execute(
+        self, name: str, arguments: object, *, session_id: str | None = None
+    ) -> ToolResult:
         """校验已解析的 JSON 参数，通过后调用注册的 handler。"""
-        _, result = self.execute_with_start_status(name, arguments)
+        _, result = self.execute_with_start_status(name, arguments, session_id=session_id)
         return result
 
-    def execute_with_start_status(self, name: str, arguments: object) -> tuple[bool, ToolResult]:
+    def execute_with_start_status(
+        self, name: str, arguments: object, *, session_id: str | None = None
+    ) -> tuple[bool, ToolResult]:
         """返回 handler 是否已启动，以及现有格式的执行结果。"""
         entry = self._tools.get(name) if isinstance(name, str) else None
         if entry is None:
@@ -167,17 +173,28 @@ class ToolManager:
             # 例如元 Schema 检查通过，但实际校验时无法解析 $ref。
             return False, _failure("invalid_tool_schema", "工具 Schema 配置无法执行校验。")
 
+        if tool.requires_session and (not isinstance(session_id, str) or not session_id.strip()):
+            return False, _failure("missing_session", "执行该工具需要可信会话标识。")
+
         try:
-            result = tool.handler(arguments)
+            if tool.requires_session:
+                result = tool.handler(arguments, session_id=session_id)
+            else:
+                result = tool.handler(arguments)
         except ToolError as exc:
             return True, _failure(exc.code, str(exc))
         except Exception:
-            return True, _failure("tool_execution_failed", "工具执行失败。")
+            failure = _failure("tool_execution_failed", "工具执行失败。")
+        else:
+            try:
+                if isinstance(result, dict) and _is_json_value(result):
+                    json.dumps(result, allow_nan=False)
+                    return True, {"ok": True, "result": result}
+            except Exception:
+                pass
+            failure = _failure("invalid_tool_result", "工具返回值必须是可序列化的 JSON 对象。")
 
-        try:
-            if isinstance(result, dict) and _is_json_value(result):
-                json.dumps(result, allow_nan=False)
-                return True, {"ok": True, "result": result}
-        except Exception:
-            pass
-        return True, _failure("invalid_tool_result", "工具返回值必须是可序列化的 JSON 对象。")
+        if tool.requires_session:
+            # 异常或无法序列化的结果不能证明已启动的会话工具未写入。
+            return True, _failure(TOOL_STATE_UNCERTAIN, "会话工具执行后的状态无法核实。")
+        return True, failure
