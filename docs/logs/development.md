@@ -142,3 +142,31 @@
 - **测试**。定向命令 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -p test_compaction.py -v` 通过 17 项，新增 5 项，耗时 2.292 秒。全量命令 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v` 通过 104 项，耗时 43.414 秒，退出码 0。独立进程读回截断后的工具历史通过 `build_messages()` 配对校验。
 - **限制**。无法安全压缩的单组仍保留在文件中，恢复进度依赖后续请求有两次维护预算。超长列表只提供前缀预览，模型无法从该工具消息获得省略条目。
 - **最终验收**。独立 Code Review 通过，负责人批准 T08 收尾。定向测试 17 项、全量 104 项通过（退出码 0）。
+
+## 2026-11-10（T09 异常语义、执行限制与完整 Trace）
+
+- **开发基线**。HEAD 为 `540fd62`，工作树干净，T08 的全量基线为 104 项。保留现有 Agent Loop、Session JSON、Todo 提交后读回校验和 Context 压缩算法。
+- **模型与工具**。Model 决策分别报告超时、连接错误、API 错误、无效响应或未预期请求错误，错误不带底层请求和响应正文。SDK 沿用 30 秒超时及零重试。Tool Manager 通过可选 `on_start` 在校验通过后、handler 调用前通知 Runtime。未注册工具及 Schema 拒绝均不启动 handler。无状态 handler 抛出的 `TimeoutError` 转为 `tool_timeout`，其他异常沿用结构化工具错误。可恢复工具错误回填后，模型可在剩余预算内修正。
+- **持久化与预算**。Todo 写入未能读回核实时记录 `unconfirmed`，同批剩余工具记录 `skipped`，本次请求失败并立即停止模型调用。已核实的写入在后续模型异常或触顶时仍可恢复。第 8 次模型调用返回文本可完成，返回工具请求则保留协议配对，跳过该批执行并返回 `limit_reached`。两次 Context 维护调用计入同一预算；失败按阶段记录，原始历史和已确认的 Todo 保留。
+- **Trace**。沿用 `agent_harness.runtime` 的 INFO 日志，`tool_trace` 与 `request_trace` 后接单行 JSON。事件使用 request ID、会话 ID、UTC 时间、序号、决策轮次及工具顺序关联。工具请求、实际启动、结果分别记录。参数仅保留有限字段的类型、字符数及已知 Todo 动作，结果仅记录有限摘要。文本、未知字段名、底层异常详情及完整请求体不进入结构化 Trace。
+- **故障注入实测**。定向执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -p test_fault_trace.py -v`，新增 16 项通过，退出码 0。第一次运行的本地引用用例在注册处失败，原因是测试 Schema 缺少要求的根 `type: object`，修正夹具后通过。全量执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，120 项通过，耗时 43.495 秒，退出码 0。
+- **脱敏证据**。确定性模型配合实际 Runtime 和临时 Session JSON 的探测退出码为 0。请求 `a626ae91a072405ca013ca6ef64c93f9` 在 UTC 15:47:32 的记录中，`sample-create` 经 requested、started、succeeded，`sample-unknown` 为 rejected 且 `started=false`，第 2 次模型调用为 `model_timeout`。最终状态为 `failed`，重新加载 JSON 仍有 1 条 Todo，历史角色依次为 user、assistant、tool、tool。本轮验证使用故障注入，既有真实 DeepSeek 闭环证据见 T05。
+- **交接与限制**。CLI 会话消息输出仍为 `session_id`、`answer`、`status`，业务失败和触顶退出码为 1。日志由调用方配置，默认 CLI 不持久化 Trace。工具超时依赖 handler 主动抛出 `TimeoutError`，同步阻塞的 handler 没有统一的硬截止或取消机制。T09 待独立只读审查。
+
+### T09 独立审查缺陷修复（2026-11-11）
+
+- **修复前复现**。在同一工具批次中使用有常见前缀和无前缀的两种合成密钥。工具均被拒绝，无前缀字符串仍出现在 Trace。独立 CLI 进程执行工具后 stdout 为 JSON、stderr 无 Trace，前置 `--trace` 进入旧的纯文本分支。注入 `os.replace` 成功后抛出 `OSError`，磁盘已经保存摘要和 10 条近期消息，Trace 却报告 `context_maintenance_failed`。
+- **Trace 信任边界**。工具名只从本轮已注册定义中取得，未匹配时写入固定标签 `unknown_tool`。Trace 的 `tool_call_id` 由决策轮次和批内位置生成，例如 `call-1-2`，与 `request_id` 一起关联事件。模型返回的原 ID 继续用于协议消息配对及回填。参数与异常仍以有界摘要记录。
+- **CLI 查看方式**。运行 `.\.venv\Scripts\python.exe -m agent_harness.cli --trace --session <ID> "<消息>"`。stderr 中每条 Trace 为独立 JSON，stdout 保留原有会话 JSON 和退出码。独立进程实测捕获 5 条事件，依次为 `request_started`、`tool_requested`、`tool_started`、`tool_result`、`request_finished`，退出码为 0。默认模式的同类请求仍无 Trace 输出。
+- **Context 保存核查**。比较并保存遇到明确的快照冲突时，直接记录 `failed/session_conflict`。其余保存异常读取权威文件一次。完整快照等于候选时记录 `recovered`，仍等于保存前快照时记录 `failed`，读回失败或观察到第三种状态时记录 `unconfirmed`。候选比对包含消息、Memory、摘要及原 Todo；核查路径只读。
+- **故障注入实测**。替换前异常为 `failed`，磁盘保留 21 条消息、空 Memory、空摘要和 1 条 Todo。替换后异常为 `recovered`，磁盘保留 10 条消息、1 条 Memory、摘要和原 Todo。替换后读回失败为 `unconfirmed`，独立重新加载仍读到已压缩状态。另一写入者已提交相同候选时，CAS 拒绝本轮保存并报告冲突；读回同样的 Context 字段但含新增 Todo 时记录 `unconfirmed`，保留权威状态。
+- **测试与边界**。定向执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -p test_fault_trace.py -v`，24 项通过，9.713 秒。全量执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，128 项通过，54.892 秒。本轮新增 8 项，两条命令退出码均为 0。验证使用确定性模型和临时会话文件。普通 I/O 异常的读回只能确认快照状态，若两个写入者产生完全相同的快照且没有明确冲突，文件内容无法区分写入来源。T09 待独立定向复审。
+
+### T09 最终限定修复（2026-11-11）
+
+- **复现**。独立 CLI 进程使用 `--trace --session` 请求不存在的会话。Runtime 已依次输出 `request_started`、`session_error`、`request_finished` 三条合法 JSON，CLI 又追加普通错误文本，第四行无法解析。stdout 为空，退出码为 1。
+- **修复**。Trace 模式复用 Runtime 已发出的会话失败事件。进入 Runtime 前的受控错误使用单条 `cli_error`，只写固定错误码及失败状态。Trace 命令用法错误同样输出 JSON，保留原用法退出码 2。普通模式继续使用原诊断文本。
+- **实测**。新增 4 项独立进程测试。缺失会话只输出上述三条 JSON，stdout 为空，退出码为 1。注入模型超时后，stderr 三条事件均可逐行解析，stdout 保留原 JSON 字段及 `failed` 状态，退出码为 1。配置异常仅输出 `config_error`，异常详情和合成路径未进入输出。普通模式缺失会话仍返回原诊断文本。既有正常工具调用测试继续验证 5 条 JSON Trace、原 stdout 结构及退出码 0。
+- **全量回归**。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，132 项通过，耗时 72.777 秒，退出码 0。
+- **最终验收**。独立复审通过，负责人批准 T09 收尾。独立定向测试 28 项（`test_fault_trace.py`）、开发端全量测试 132 项均通过。
+- **已知限制**。同步阻塞 handler 无统一硬超时；Trace 默认不持久化，由调用方配置日志。

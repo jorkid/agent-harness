@@ -40,6 +40,14 @@ def _batch(*calls: ToolCall) -> ToolCallsDecision:
     }
 
 
+def _tool_results(trace) -> list[dict]:
+    events = [
+        json.loads(record.getMessage().removeprefix("tool_trace "))
+        for record in trace.records if record.getMessage().startswith("tool_trace ")
+    ]
+    return [event for event in events if event["event"] == "tool_result"]
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.model = Mock(spec=Model)
@@ -62,9 +70,10 @@ class RuntimeTests(unittest.TestCase):
             {"kind": "final", "text": "answer A"},
             {"kind": "final", "text": "answer B"},
         )
-        with self.assertNoLogs("agent_harness.runtime", level="INFO"):
+        with self.assertLogs("agent_harness.runtime", level="INFO") as trace:
             first = self.runtime.run("message A", "session-A")
             second = self.runtime.run("message B", "session-B")
+        self.assertFalse(any(record.getMessage().startswith("tool_trace ") for record in trace.records))
 
         self.assertEqual(first, {"session_id": "session-A", "answer": "answer A", "status": "completed"})
         self.assertEqual(second, {"session_id": "session-B", "answer": "answer B", "status": "completed"})
@@ -88,10 +97,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertEqual(tool_message["tool_call_id"], "call_1")
         self.assertEqual(json.loads(tool_message["content"]), {"ok": True, "result": {"value": 476}})
-        self.assertEqual(json.loads(trace.records[0].getMessage().removeprefix("tool_trace ")), {
-            "session_id": "trusted", "tool_call_id": "call_1", "tool_name": "calculator",
-            "started": True, "ok": True, "result_summary": {"field_count": 1, "value": 476},
-        })
+        event, = _tool_results(trace)
+        self.assertEqual(
+            (event["session_id"], event["tool_call_id"], event["tool_name"], event["started"], event["ok"]),
+            ("trusted", "call-1-1", "calculator", True, True),
+        )
+        self.assertEqual(event["result_summary"], {"field_count": 1, "value": 476})
 
     def test_feedback_distinguishes_handler_error_and_validation_rejection(self) -> None:
         rejected = _call("invalid", "1+1")
@@ -109,7 +120,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([item["tool_call_id"] for item in messages], ["divide", "invalid"])
         errors = [json.loads(item["content"]) for item in messages]
         self.assertEqual([item["error"]["code"] for item in errors], ["division_by_zero", "invalid_arguments"])
-        events = [json.loads(record.getMessage().removeprefix("tool_trace ")) for record in trace.records]
+        events = _tool_results(trace)
         self.assertEqual([event["started"] for event in events], [True, False])
         self.assertEqual([event["ok"] for event in events], [False, False])
         self.assertNotIn("spoofed", " ".join(trace.output))
@@ -121,9 +132,10 @@ class RuntimeTests(unittest.TestCase):
         with self.assertLogs("agent_harness.runtime", level="INFO") as trace:
             self.runtime.run("input", "trusted")
 
-        self.assertNotIn(secret, trace.output[0])
-        self.assertIn("[redacted]", trace.output[0])
-        self.assertIn("unknown_tool", trace.output[0])
+        self.assertNotIn(secret, " ".join(trace.output))
+        event, = _tool_results(trace)
+        self.assertEqual(event["tool_name"], "unknown_tool")
+        self.assertEqual(event["error_code"], "unknown_tool")
 
     def test_multiple_tools_keep_order_and_ids(self) -> None:
         batch = _batch(
@@ -141,9 +153,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(json.loads(messages[0]["content"])["result"]["mock"])
         self.assertEqual(json.loads(messages[1]["content"])["result"]["value"], 11)
         self.assertEqual(
-            [json.loads(record.getMessage().removeprefix("tool_trace "))["tool_call_id"]
-             for record in trace.records],
-            ["search-first", "calc-second"],
+            [event["tool_call_id"] for event in _tool_results(trace)],
+            ["call-1-1", "call-1-2"],
         )
 
     def test_eighth_tool_decision_stops_model_and_skips_its_batch(self) -> None:
@@ -156,9 +167,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["status"], "limit_reached")
         self.assertIn("未获得最终回答", result["answer"])
         self.assertEqual(self.model.decide.call_count, 8)
-        events = [json.loads(record.getMessage().removeprefix("tool_trace ")) for record in trace.records]
+        events = _tool_results(trace)
         self.assertEqual([event["started"] for event in events], [True] * 7 + [False, False])
-        self.assertEqual([event["tool_call_id"] for event in events[-2:]], ["last-a", "last-b"])
+        self.assertEqual([event["tool_call_id"] for event in events[-2:]], ["call-8-1", "call-8-2"])
         self.assertEqual([event["error_code"] for event in events[-2:]], ["limit_reached"] * 2)
 
     def test_eighth_final_decision_still_completes(self) -> None:

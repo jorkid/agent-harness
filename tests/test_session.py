@@ -270,7 +270,7 @@ class SessionTests(unittest.TestCase):
             with self.assertLogs("agent_harness.runtime", level="INFO") as trace:
                 result = self.runtime.run("create", session_id)
         self.assertEqual(result["status"], "failed")
-        self.assertIn("tool_state_uncertain", trace.output[0])
+        self.assertIn("tool_state_uncertain", " ".join(trace.output))
         self.model.decide.assert_called_once()
         self.assertEqual([item["content"] for item in load(session_id)["todos"]], ["exists"])
 

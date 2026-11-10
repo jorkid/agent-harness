@@ -20,6 +20,10 @@ from agent_harness.config import Settings
 class ModelError(Exception):
     """模型调用失败。信息已脱敏，不包含 API Key 或原始敏感请求。"""
 
+    def __init__(self, message: str, *, code: str = "model_error") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class ToolCall(TypedDict):
     tool_call_id: str
@@ -193,9 +197,16 @@ class Model:
                     for tool in tool_definitions
                 ]
             response = self._client.chat.completions.create(**request)
-        except APIError as exc:
-            raise ModelError(f"模型决策请求失败（{type(exc).__name__}）。") from None
-        except Exception as exc:
-            raise ModelError(f"模型决策请求发生未预期错误（{type(exc).__name__}）。") from None
+        except APITimeoutError:
+            raise ModelError("模型请求超时。", code="model_timeout") from None
+        except APIConnectionError:
+            raise ModelError("无法连接模型服务。", code="model_connection_error") from None
+        except APIError:
+            raise ModelError("模型服务请求失败。", code="model_api_error") from None
+        except Exception:
+            raise ModelError("模型请求发生未预期错误。", code="model_request_error") from None
 
-        return _parse_decision(response)
+        try:
+            return _parse_decision(response)
+        except ModelError as exc:
+            raise ModelError(str(exc), code="model_invalid_response") from None

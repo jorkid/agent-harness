@@ -144,9 +144,14 @@ class ToolManager:
         return result
 
     def execute_with_start_status(
-        self, name: str, arguments: object, *, session_id: str | None = None
+        self,
+        name: str,
+        arguments: object,
+        *,
+        session_id: str | None = None,
+        on_start: Callable[[], None] | None = None,
     ) -> tuple[bool, ToolResult]:
-        """返回 handler 是否已启动，以及现有格式的执行结果。"""
+        """校验后调用 on_start，再返回 handler 是否已启动及执行结果。"""
         entry = self._tools.get(name) if isinstance(name, str) else None
         if entry is None:
             return False, _failure("unknown_tool", "工具未注册。")
@@ -176,6 +181,8 @@ class ToolManager:
         if tool.requires_session and (not isinstance(session_id, str) or not session_id.strip()):
             return False, _failure("missing_session", "执行该工具需要可信会话标识。")
 
+        if on_start is not None:
+            on_start()
         try:
             if tool.requires_session:
                 result = tool.handler(arguments, session_id=session_id)
@@ -183,6 +190,8 @@ class ToolManager:
                 result = tool.handler(arguments)
         except ToolError as exc:
             return True, _failure(exc.code, str(exc))
+        except TimeoutError:
+            failure = _failure("tool_timeout", "工具执行超时。")
         except Exception:
             failure = _failure("tool_execution_failed", "工具执行失败。")
         else:

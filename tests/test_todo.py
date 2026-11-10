@@ -29,7 +29,11 @@ def _decision(*calls: tuple[str, dict]) -> dict:
 
 
 def _events(trace) -> list[dict]:
-    return [json.loads(record.getMessage().removeprefix("tool_trace ")) for record in trace.records]
+    events = [
+        json.loads(record.getMessage().removeprefix("tool_trace "))
+        for record in trace.records if record.getMessage().startswith("tool_trace ")
+    ]
+    return [event for event in events if event["event"] == "tool_result"]
 
 
 class TodoTests(unittest.TestCase):
