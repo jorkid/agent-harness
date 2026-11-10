@@ -42,3 +42,17 @@
 - **最终验证**。在 Python 3.12.0、jsonschema 4.26.0 环境运行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，29 项全部通过，耗时 0.148 秒，退出码 0。覆盖外部引用与 `multipleOf` 的注册拒绝、同文档引用和原有工具行为。
 - **已知限制**。注册检查扫描整个 Schema 文档，包含受限关键字形状的示例数据也可能被拒绝。缺失的同文档引用目标在执行时返回 `invalid_tool_schema`。Calculator 的成功结果以 `int` 或 `float` 输出，小数最终转换可能舍入。真实模型的工具调用兼容性由 T03 验证。
 - **验收**。独立 Code Review 最终通过，项目负责人批准 T02 收尾。
+
+## 2026-11-10（T03 Model 工具协议适配与调用解析）
+
+- **起点**。核对 HEAD 为 `9d60cd5`，T01 和 T02 已本地提交。保持已批准的 Model 与 Tool Manager 职责边界，原有 `Model.chat(text)` 继续作为 T01 CLI 的入口。
+- **实现**。`Model.decide(messages, tool_definitions=())` 发送一次 Chat Completions 请求。将公开定义中的 `name`、`description` 和 `parameters_schema` 映射为 API 的 `type: "function"` 和 `function` 字段。采用普通工具模式，显式关闭 thinking，按可见消息构造回填数据。请求格式依据 [DeepSeek Tool Calls](https://api-docs.deepseek.com/guides/tool_calls/)。
+- **响应与错误**。`kind: "final"` 携带最终 `text`。 `kind: "tool_calls"` 携带按响应顺序排列的 `tool_calls` 和 `assistant_message`。每条调用包含 `tool_call_id`、`name`、解码后的 JSON 对象 `arguments`。assistant 消息保留可见 `content` 及原始参数字符串。空回复、缺字段、重复调用 ID、畸形或非对象参数、不支持的协议及请求失败返回受控 `ModelError`。
+- **确定性测试**。在 Python 3.12.0、OpenAI SDK 3.48.0 环境执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`。新增 12 项 Model 测试，完整测试共 41 项通过，耗时 0.148 秒，退出码 0。覆盖最终文本、单个和多个工具调用、异常结构、Schema 转换、可见消息重放数据和 T01 入口兼容性。
+- **真实 API 验证**。使用现有配置，执行 PowerShell `$probe | .\.venv\Scripts\python.exe -B -`。脚本用 `Model.decide` 各发送一次合成文本和工具提示，命令退出码为 0。保留通过白名单检查的字段如下，两个请求都使用 `deepseek-flash`。
+  - 普通回复。提示 `Reply with exactly T03_OK and no punctuation.`，结果 `{"kind":"final","text":"T03_OK"}`。
+  - 工具请求。传入 Calculator / Mock Search 的公开定义。提示 `Use the calculator tool exactly once with the expression 17*(23+5).`，结果 `{"kind":"tool_calls","tool_call_id":"call_00_YrGMcYgbb1LXwzNBW3Y33883","name":"calculator","arguments":{"expression":"17*(23+5)"},"executed":false}`。同时核对了 assistant 消息中的 ID 及原始参数字符串与解析结果一致。
+- **T04 交接**。Runtime 先原样追加 `assistant_message`，再按 `tool_calls` 顺序将工具名与解码参数交给 Tool Manager。为每条调用追加带匹配 `tool_call_id` 的 `role: "tool"` 消息，`content` 使用工具结果或错误的 JSON 字符串。解析错误抛出 `ModelError`，整次响应没有可分发的部分结果。
+- **最终验收**。独立 Code Review 已通过，项目负责人批准 T03 收尾。真实工具执行和结果回填后的下一轮请求属于 T04 验证。
+- **收尾复测**。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，41 项全部通过，耗时 0.164 秒，退出码 0。
+- **SDK 自动重试风险**。本地 OpenAI SDK 3.48.0 默认 `max_retries=2`，当前 Model 沿用该设置。遇到可重试的网络错误或 HTTP 响应时，一次 `Model.decide()` 最多可能发起三次 HTTP 尝试。Runtime 记录的模型决策次数与 HTTP 尝试次数可能不同，重试也可能增加延迟及服务用量。
