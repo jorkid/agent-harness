@@ -136,43 +136,48 @@ class ToolManager:
 
     def execute(self, name: str, arguments: object) -> ToolResult:
         """校验已解析的 JSON 参数，通过后调用注册的 handler。"""
+        _, result = self.execute_with_start_status(name, arguments)
+        return result
+
+    def execute_with_start_status(self, name: str, arguments: object) -> tuple[bool, ToolResult]:
+        """返回 handler 是否已启动，以及现有格式的执行结果。"""
         entry = self._tools.get(name) if isinstance(name, str) else None
         if entry is None:
-            return _failure("unknown_tool", "工具未注册。")
+            return False, _failure("unknown_tool", "工具未注册。")
         tool, validator = entry
 
         try:
             if not isinstance(arguments, dict) or not _is_json_value(arguments):
-                return _failure("invalid_arguments", "工具参数必须是合法的 JSON 对象。")
+                return False, _failure("invalid_arguments", "工具参数必须是合法的 JSON 对象。")
         except RecursionError:
-            return _failure("invalid_arguments", "工具参数嵌套过深或含循环引用。")
+            return False, _failure("invalid_arguments", "工具参数嵌套过深或含循环引用。")
 
         try:
             validator.validate(arguments)
         except ValidationError as exc:
-            return _failure(
+            return False, _failure(
                 "invalid_arguments",
                 f"{exc.json_path} 未通过 Schema 的 {exc.validator} 约束。",
             )
         except OverflowError:
-            return _failure(
+            return False, _failure(
                 "invalid_arguments", "当前参数与数值约束的组合超出 Schema 校验器处理范围。"
             )
         except Exception:
             # 例如元 Schema 检查通过，但实际校验时无法解析 $ref。
-            return _failure("invalid_tool_schema", "工具 Schema 配置无法执行校验。")
+            return False, _failure("invalid_tool_schema", "工具 Schema 配置无法执行校验。")
 
         try:
             result = tool.handler(arguments)
         except ToolError as exc:
-            return _failure(exc.code, str(exc))
+            return True, _failure(exc.code, str(exc))
         except Exception:
-            return _failure("tool_execution_failed", "工具执行失败。")
+            return True, _failure("tool_execution_failed", "工具执行失败。")
 
         try:
             if isinstance(result, dict) and _is_json_value(result):
                 json.dumps(result, allow_nan=False)
-                return {"ok": True, "result": result}
+                return True, {"ok": True, "result": result}
         except Exception:
             pass
-        return _failure("invalid_tool_result", "工具返回值必须是可序列化的 JSON 对象。")
+        return True, _failure("invalid_tool_result", "工具返回值必须是可序列化的 JSON 对象。")

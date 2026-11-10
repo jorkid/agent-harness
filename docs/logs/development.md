@@ -56,3 +56,19 @@
 - **最终验收**。独立 Code Review 已通过，项目负责人批准 T03 收尾。真实工具执行和结果回填后的下一轮请求属于 T04 验证。
 - **收尾复测**。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，41 项全部通过，耗时 0.164 秒，退出码 0。
 - **SDK 自动重试风险**。本地 OpenAI SDK 3.48.0 默认 `max_retries=2`，当前 Model 沿用该设置。遇到可重试的网络错误或 HTTP 响应时，一次 `Model.decide()` 最多可能发起三次 HTTP 尝试。Runtime 记录的模型决策次数与 HTTP 尝试次数可能不同，重试也可能增加延迟及服务用量。
+
+## 2026-11-10（T04 自主 Agent Loop 与最小 Trace）
+
+- **起点与范围**。基于已提交的 T03（`bccd895`）。Runtime 以 `Runtime(model, tools).run(message, session_id)` 为入口，用请求内的 Messages 协调 Model 和 Calculator / Mock Search。结果包含 `session_id`、`answer` 和 `status`。
+- **循环与预算**。每次 `Model.decide()` 消耗一次预算。收到工具批次时先原样追加 assistant 消息，再顺序追加按 ID 配对的 JSON 工具结果或错误。第 8 次若为最终回答，则返回 `completed`；若仍请求工具，则按已批准设计停止新工具执行，为每个调用 ID 记录未启动的预算错误，并返回 `limit_reached`。模型抛出 `ModelError` 时返回 `failed`。
+- **执行状态与 Trace**。Tool Manager 新增 `execute_with_start_status(name, arguments)`，返回实际 handler 启动标记和既有结果结构。原有 `execute()` 契约保留。Runtime 通过 `agent_harness.runtime` 的 INFO 日志输出 JSON Trace，包含可信会话标识、调用 ID、工具名、开始状态、成功状态、结果摘要或错误码。Trace 省略原始参数及自由文本，并遮盖常见 `sk-` 形态。
+- **SDK 配置**。按已批准决策设 `max_retries=0`、`timeout=30.0`。通过本地测试与真实请求前的客户端检查核实两个实际值。
+- **本地验证**。运行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`。50 项全部通过，耗时 0.487 秒，退出码 0。新增 9 项，覆盖直接回复、真实工具在模拟模型循环中的执行和回填、错误与拒绝、批次顺序、第 8 次预算边界、SDK 超时与配置，以及最小脱敏。
+- **真实闭环验证**。以 PowerShell `$probe | .\.venv\Scripts\python.exe -B -` 运行观察脚本，现有配置使用 `deepseek-flash`，退出码 0。合成提示要求调用 Calculator 计算 `17*(23+5)`，收到工具结果后只回复数字。模型调用共两次。
+  - 首次真实响应 `kind="tool_calls"`，工具 `calculator`，ID `call_00_ffdJnf6VsTABZQvQTDOL5059`，参数 `{"expression":"17*(23+5)"}`。
+  - 真实 Runtime Trace 记录同 ID，`session_id="t04-live-calculator"`，`started=true`、`ok=true`，摘要 `{"field_count":1,"value":476}`。第二次请求确认原样保留 assistant 消息，并回填同 ID 的 `role="tool"` 消息，结果 `{"ok":true,"result":{"value":476}}`。
+  - 第二次真实响应为 `final`，Runtime 返回 `{"session_id":"t04-live-calculator","answer":"476","status":"completed"}`。
+- **后续对接与边界**。T05 可沿执行边界从 Runtime 单独接收可信 session_id。T06 可将每次请求构建和保存会话状态的职责接到 Runtime 外围。本轮仅使用请求内消息，Trace 由调用方启用 INFO 接收。持久化、会话恢复、完整 Trace 与跨轮历史留给各自任务。
+- **验收状态**。T04 DoD 已取得本地与真实闭环验证证据，待独立 Code Review。
+- **最终验收**。独立 Code Review 已通过，项目负责人批准 T04 收尾。
+- **剩余风险**。Trace 目前由调用方启用 INFO 日志接收，尚未持久化到文件（完整 Trace 留待 T09）；会话历史仅存在于单次请求的 Messages 内，跨轮记忆与 Session 恢复留待 T05–T07；真实闭环验证仅覆盖 Calculator，Mock Search 及多工具连用的真实端到端验证留待后续任务。

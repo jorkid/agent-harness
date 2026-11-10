@@ -136,6 +136,8 @@ class Model:
         self._client = OpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
+            max_retries=0,
+            timeout=30.0,
         )
 
     def chat(self, text: str) -> str:
