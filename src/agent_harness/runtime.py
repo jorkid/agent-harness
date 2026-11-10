@@ -8,7 +8,20 @@ import re
 from threading import Lock
 from typing import Any, Literal, TypedDict
 
-from agent_harness.context import ContextError, build_messages
+from agent_harness.context import (
+    MAX_USER_CHARS,
+    ContextError,
+    bound_final_answer,
+    build_messages,
+    check_request_size,
+    format_tool_result,
+    memory_candidates,
+    memory_request,
+    parse_memory,
+    parse_summary,
+    split_for_compaction,
+    summary_request,
+)
 from agent_harness.model import Model, ModelError
 from agent_harness.tools import ToolManager, ToolResult
 from agent_harness.session import SessionConflictError, SessionError, SessionState, SessionStore
@@ -109,8 +122,15 @@ class Runtime:
 
     def run(self, message: str, session_id: str) -> RuntimeResult:
         """使用调用方提供的可信会话标识处理一条消息。"""
+        if len(message) > MAX_USER_CHARS:
+            return {
+                "session_id": session_id,
+                "answer": f"用户消息超过 {MAX_USER_CHARS} 字符限制。",
+                "status": "failed",
+            }
         if self._todos is None:
-            return self._run([{"role": "user", "content": message}], session_id)
+            result, _ = self._run([{"role": "user", "content": message}], session_id)
+            return result
         # 同一个 Runtime 串行加载和更新会话，避免覆盖另一个请求的快照。
         with self._run_lock:
             state = self.restore_session(session_id)
@@ -120,18 +140,62 @@ class Runtime:
                 raise SessionError(str(exc)) from None
             history = state["messages"]
             try:
-                messages = build_messages(history, message)
+                messages = build_messages(
+                    history, message, summary=state["summary"], memory=state["memory"]
+                )
             except ContextError as exc:
                 return {"session_id": session_id, "answer": str(exc), "status": "failed"}
             start = len(messages) - 1
-            result = self._run(messages, session_id)
+            result, decisions = self._run(messages, session_id)
             if not self._save_history(session_id, history, messages[start:]):
                 return {
                     "session_id": session_id,
                     "answer": "本轮历史未能确认保存。此前已确认的工具写入仍保留。",
                     "status": "failed",
                 }
+            if result["status"] == "completed" and decisions <= _MAX_DECISIONS - 2:
+                self._compact_history(session_id)
             return result
+
+    def _compact_history(self, session_id: str) -> None:
+        store = self._session_store()
+        try:
+            state = store.load(session_id)
+            batch = split_for_compaction(
+                state["messages"], summary=state["summary"], memory=state["memory"]
+            )
+            if batch is None:
+                return
+            if batch.oversized_groups:
+                _logger.warning(
+                    "context_compaction_retained_oversized_groups session_id=%s count=%d",
+                    session_id, batch.oversized_groups,
+                )
+            older = batch.older
+            candidates = memory_candidates(state["memory"], older)
+            extract = memory_request(candidates)
+            summarize = summary_request(state["summary"], older)
+            check_request_size(extract)
+            check_request_size(summarize)
+            memory = parse_memory(self._maintenance_text(extract), candidates)
+            summary = parse_summary(self._maintenance_text(summarize))
+            store.save(
+                session_id,
+                {**state, "messages": batch.retained, "memory": memory, "summary": summary},
+                expected=state,
+            )
+        except ContextError as exc:
+            _logger.warning("context_compaction_deferred session_id=%s: %s", session_id, exc)
+        except (ModelError, SessionError):
+            # 追加历史已经独立提交；压缩失败不回滚，也不重试覆盖。
+            return
+
+    def _maintenance_text(self, messages: list[dict[str, Any]]) -> str:
+        assert self._model is not None
+        decision = self._model.decide(messages)
+        if decision["kind"] != "final":
+            raise ContextError("压缩请求未返回文本。")
+        return decision["text"]
 
     def _save_history(
         self, session_id: str, history: list[dict[str, Any]], new: list[dict[str, Any]]
@@ -153,7 +217,9 @@ class Runtime:
                     return False
         return False
 
-    def _run(self, messages: list[dict[str, Any]], session_id: str) -> RuntimeResult:
+    def _run(
+        self, messages: list[dict[str, Any]], session_id: str
+    ) -> tuple[RuntimeResult, int]:
         if self._model is None:
             raise SessionError("发送消息需要配置模型。")
         definitions = self._tools.public_definitions()
@@ -161,21 +227,26 @@ class Runtime:
 
         for turn in range(1, _MAX_DECISIONS + 1):
             try:
+                check_request_size(messages)
+            except ContextError as exc:
+                return {"session_id": session_id, "answer": str(exc), "status": "failed"}, turn - 1
+            try:
                 decision = self._model.decide(list(messages), definitions)
             except ModelError:
                 return {
                     "session_id": session_id,
                     "answer": f"模型请求失败，未获得最终回答。此前已启动 {started_count} 次工具调用。",
                     "status": "failed",
-                }
+                }, turn
 
             if decision["kind"] == "final":
-                messages.append({"role": "assistant", "content": decision["text"]})
+                answer = bound_final_answer(decision["text"])
+                messages.append({"role": "assistant", "content": answer})
                 return {
                     "session_id": session_id,
-                    "answer": decision["text"],
+                    "answer": answer,
                     "status": "completed",
-                }
+                }, turn
 
             messages.append(decision["assistant_message"])
             uncertain = False
@@ -204,7 +275,7 @@ class Runtime:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": json.dumps(result, allow_nan=False),
+                    "content": format_tool_result(result),
                 })
                 if not result["ok"] and result["error"]["code"] == TOOL_STATE_UNCERTAIN:
                     uncertain = True
@@ -214,7 +285,7 @@ class Runtime:
                     "session_id": session_id,
                     "answer": "工具写入状态无法核实，已停止本次请求。此前的操作未回滚。",
                     "status": "failed",
-                }
+                }, turn
 
         return {
             "session_id": session_id,
@@ -223,4 +294,4 @@ class Runtime:
                 f"此前已启动 {started_count} 次工具调用。"
             ),
             "status": "limit_reached",
-        }
+        }, _MAX_DECISIONS
