@@ -90,3 +90,35 @@
   1. **内存态无持久化**：Todo 状态只存在于单个 `TodoStore` 实例，进程重启即丢失；会话持久化与重启恢复留待 T06。
   2. **去重仅限活跃记录**：`create` 去重只对当前未删除的同内容记录生效，删除后重建相同内容会生成新 ID。
   3. **无跨轮对话历史**：每次请求的 `messages` 均由单条用户消息新建，Runtime 不保存历史，跨轮记忆留待 T06–T07。
+
+## 2026-11-10（T06 Session JSON 隔离、创建与重启恢复）
+
+- **范围**。开始时 HEAD 为 `c78bcaf`，已验收的 T05 仍在工作树。本轮保留其可信 Session 注入、Todo ID、去重和异常语义。
+- **会话文件**。`SessionStore(directory)` 提供 `create()`、`load(session_id)` 和 `save(session_id, state, expected=原始快照)`。创建时生成 32 位小写十六进制 UUID，文件包含 `messages`、`todos`、`memory` 和 `summary`。加载与保存拒绝非法 ID、缺失文件、符号链接或硬链接别名及无效状态。
+- **原子写入**。在目标目录写完整临时 JSON，执行 `flush()`、`os.fsync()`，关闭句柄后用 `os.replace()` 替换，最后清理临时文件。保存要求目标会话已存在。
+- **Todo 对接**。Runtime 加载权威 JSON，按可信会话 ID 恢复已有 Todo。每次变更先构建候选快照，Runtime 保存后读回整个 JSON，确认与候选一致才更新内存并报告成功。异常后若文件等于候选则报告 `recovered=true`；若仍是旧状态则返回 `todo_save_failed`；读回失败或状态不符则返回 `tool_state_uncertain` 并停止本次请求。后续模型异常不影响此前已核实的写入。
+- **CLI**。在仓库根目录，`python -m agent_harness.cli --new-session` 创建会话，`python -m agent_harness.cli --session <ID>` 选择并查看待办，`python -m agent_harness.cli --session <ID> "<消息>"` 恢复并执行请求，输出 Session ID、答案和状态。保留纯文本调用。默认数据目录为当前目录下的 `sessions/`，沿用已有 Git 忽略规则。
+- **实际验证**。接入后原有 60 项测试通过。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，71 项全部通过，耗时 30.868 秒，退出码 0，新增 11 项。
+  - 跨进程 CLI 测试使用确定性模拟模型，实际执行 CLI、Runtime、Tool Manager 和文件操作。分别创建 A/B，写入各自待办，在新的独立进程选择 A/B，再修改 A。恢复前后 A 的 Todo ID 一致，B 保持原数据。
+  - 替换前注入 `OSError`，旧 JSON 字节保持一致，临时文件清理，返回 `todo_save_failed`。替换后注入 `OSError`，权威文件读回与候选一致，返回 `recovered=true`。保存方法未替换文件却返回时，同样通过读回识别未写入。
+  - 替换后注入读回失败，Trace 为 `tool_state_uncertain`，Runtime 停止调用；随后恢复读取可见真实写入。另验证后续 `ModelError` 后新建 SessionStore 仍能读回已确认的待办。
+- **T07 交接与限制**。T07 可通过 Runtime 加载的 `SessionState` 读取已有 `messages`，用 SessionStore 保存更新后的四字段快照。本轮初始化并保留历史和记忆字段，对话历史构建及记录留给 T07。支持同一个 Runtime 实例内串行执行，或同目录的 CLI 进程先后运行。同目录并发写入及断电级持久性不在当前保证范围内。
+- **最终验收**。独立 Code Review 通过，负责人批准 T06 收尾。全量 `save` 接口修正为 `save(session_id, state, expected=原始快照)` 做乐观并发校验，过期快照不再覆盖较新的 Todo。
+
+## 2026-11-10（T07 多轮历史与基础 Context）
+
+- **Context 与持久化**。`build_messages(history, message)` 校验历史工具调用与结果的顺序及 ID，并拼接同会话历史和本轮用户消息。Runtime 保存本轮新增的用户消息、完整工具批次和真实最终回答。系统指令仅用于模型请求。模型失败或预算触顶仍保存已产生的消息和成对工具结果。
+- **追加故障**。Runtime 通过 `append_messages(..., expected_messages=history)` 基于权威 JSON 追加，保留 Todo、Memory 与 Summary。异常后读回磁盘，已写入则视为成功，确认仍是原历史才重试一次。读回失败或发生冲突时停止，已确认 Todo 写入保留。
+- **本地验证**。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，84 项通过，耗时 45.601 秒，退出码 0。新增 8 项。独立 CLI 进程验证了恢复后模型请求携带原 Todo 工具结果。首次完整运行有 3 项旧测试夹具未适配新增历史，调整断言、当前消息计数和读回注入后复跑通过。
+- **真实 DeepSeek**。用 `$probe | .\.venv\Scripts\python.exe -B -` 运行脱敏探测，模型为 `deepseek-flash`。首次探测通过普通追问，未通过 Todo 更新断言。复测显式使用 UTF-8，退出码 0。
+  - 重新创建 Runtime 并加载同一会话后，模型从前文答出合成睡觉时间 `22:47`。A 和 B 分别保存 4 条和 2 条消息，B 回复未包含 A 的时间。
+  - 创建「写论文」的调用 ID 为 `call_00_P9hyNdVacHAbArb6Kfsw0841`。重新加载后，模型对「把刚才那个改到明天」发出更新调用 `call_00_XvpL7I082ujb9qILI9kU3819`。两次 Trace 都证实 handler 启动并成功。权威 JSON 中 Todo ID `8cae9d4c01ae4c1888dcfcae666c0ee5` 保持不变，内容更新为「写论文（明天）」。
+  - 两条待办均可能是目标时，模型先询问，工具变更次数为 0，磁盘 Todo 快照保持一致。
+- **边界与 T08 交接**。Context 可接受 T08 提供的历史窗口，窗口需保留完整的 assistant/tool 消息组。当前发送完整历史。自然语言指代和歧义判断由模型依据系统指令处理，工具层继续强制可信会话和 ID 校验。
+- **最终验收**。独立定向复审通过，负责人批准 T07 收尾。完整测试 87 项通过（退出码 0）。
+
+### 历史协议定向修复
+
+- 负责人确认其他窗口停写，并批准在现有工作树上限定修复 T07。Context 补充了工具结果的字符串 `content` 校验，以及 assistant 工具调用的非空 ID、`type="function"`、函数定义、非空函数名和字符串参数校验。原顺序及调用 ID 配对检查继续生效。非法历史通过既有受控错误路径在调用 Model 前终止。
+- 新增 3 项回归测试，覆盖 11 个缺失或格式错误场景。修复前定向运行复现 11 个失败，修复后 3 项全部通过。完整命令为 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，87 项通过，耗时 30.508 秒，退出码 0。
+- 已知限制。按负责人决定，Todo 继续自主调用，保留原有澄清提示、可信 Session、Todo ID 和参数校验。目标有歧义时，模型仍可能选择错误但合法的 Todo ID。此轮仅修复历史协议，待独立定向复审。

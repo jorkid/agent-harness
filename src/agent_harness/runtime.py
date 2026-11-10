@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+from threading import Lock
 from typing import Any, Literal, TypedDict
 
+from agent_harness.context import ContextError, build_messages
 from agent_harness.model import Model, ModelError
 from agent_harness.tools import ToolManager, ToolResult
-from agent_harness.tools.registry import TOOL_STATE_UNCERTAIN
+from agent_harness.session import SessionConflictError, SessionError, SessionState, SessionStore
+from agent_harness.tools.registry import TOOL_STATE_UNCERTAIN, ToolError
+from agent_harness.tools.todo import TodoItem, TodoStore, create_todo_tool
 
 _MAX_DECISIONS = 8
 _API_KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{12,}")
@@ -49,19 +53,115 @@ def _log_tool_result(
 
 
 class Runtime:
-    def __init__(self, model: Model, tools: ToolManager) -> None:
+    def __init__(
+        self, model: Model | None, tools: ToolManager, *, sessions: SessionStore | None = None
+    ) -> None:
         self._model = model
         self._tools = tools
+        self._sessions = sessions
+        self._run_lock = Lock()
+        self._todos = None
+        if sessions is not None:
+            self._todos = TodoStore(commit=self._commit_todos)
+            tools.register(create_todo_tool(self._todos))
+
+    def _session_store(self) -> SessionStore:
+        if self._sessions is None:
+            raise SessionError("未配置会话存储。")
+        return self._sessions
+
+    def create_session(self) -> str:
+        return self._session_store().create()
+
+    def restore_session(self, session_id: str) -> SessionState:
+        return self._session_store().load(session_id)
+
+    def _commit_todos(
+        self, session_id: str, previous_todos: list[TodoItem], todos: list[TodoItem]
+    ) -> bool:
+        store = self._session_store()
+        try:
+            before = store.load(session_id)
+        except SessionError:
+            raise ToolError("todo_save_failed", "保存前无法读取会话，未开始写入。") from None
+
+        if before["todos"] != previous_todos:
+            raise ToolError("todo_save_conflict", "会话待办已变更，未写入过期快照。")
+
+        expected: SessionState = {**before, "todos": todos}
+        recovered = False
+        try:
+            store.save(session_id, expected, expected=before)
+        except SessionConflictError as exc:
+            raise ToolError("todo_save_conflict", str(exc)) from None
+        except Exception:
+            recovered = True
+
+        try:
+            observed = store.load(session_id)
+        except Exception:
+            raise ToolError(TOOL_STATE_UNCERTAIN, "无法读取会话 JSON 核实写入。") from None
+        if observed == expected:
+            return recovered
+        if observed == before:
+            raise ToolError("todo_save_failed", "已核实会话 JSON 未发生变更。")
+        raise ToolError(TOOL_STATE_UNCERTAIN, "会话 JSON 与预期写入状态不一致。")
 
     def run(self, message: str, session_id: str) -> RuntimeResult:
         """使用调用方提供的可信会话标识处理一条消息。"""
-        messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
+        if self._todos is None:
+            return self._run([{"role": "user", "content": message}], session_id)
+        # 同一个 Runtime 串行加载和更新会话，避免覆盖另一个请求的快照。
+        with self._run_lock:
+            state = self.restore_session(session_id)
+            try:
+                self._todos.restore(session_id, state["todos"])
+            except ToolError as exc:
+                raise SessionError(str(exc)) from None
+            history = state["messages"]
+            try:
+                messages = build_messages(history, message)
+            except ContextError as exc:
+                return {"session_id": session_id, "answer": str(exc), "status": "failed"}
+            start = len(messages) - 1
+            result = self._run(messages, session_id)
+            if not self._save_history(session_id, history, messages[start:]):
+                return {
+                    "session_id": session_id,
+                    "answer": "本轮历史未能确认保存。此前已确认的工具写入仍保留。",
+                    "status": "failed",
+                }
+            return result
+
+    def _save_history(
+        self, session_id: str, history: list[dict[str, Any]], new: list[dict[str, Any]]
+    ) -> bool:
+        store = self._session_store()
+        expected = [*history, *new]
+        for _ in range(2):
+            try:
+                store.append_messages(session_id, new, expected_messages=history)
+                return True
+            except SessionError:
+                try:
+                    observed = store.load(session_id)["messages"]
+                except SessionError:
+                    return False
+                if observed == expected:
+                    return True
+                if observed != history:
+                    return False
+        return False
+
+    def _run(self, messages: list[dict[str, Any]], session_id: str) -> RuntimeResult:
+        if self._model is None:
+            raise SessionError("发送消息需要配置模型。")
         definitions = self._tools.public_definitions()
         started_count = 0
 
         for turn in range(1, _MAX_DECISIONS + 1):
             try:
-                decision = self._model.decide(messages, definitions)
+                decision = self._model.decide(list(messages), definitions)
             except ModelError:
                 return {
                     "session_id": session_id,
@@ -70,6 +170,7 @@ class Runtime:
                 }
 
             if decision["kind"] == "final":
+                messages.append({"role": "assistant", "content": decision["text"]})
                 return {
                     "session_id": session_id,
                     "answer": decision["text"],

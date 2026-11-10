@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from threading import Lock
 from typing import Any, TypedDict
 from uuid import uuid4
@@ -18,9 +18,23 @@ class TodoItem(TypedDict):
 class TodoStore:
     """保存待办，所有查询和写入都使用可信会话标识。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, commit: Callable[[str, list[TodoItem], list[TodoItem]], bool] | None = None
+    ) -> None:
+        self._commit = commit
         self._items: dict[str, tuple[str, TodoItem]] = {}
         self._lock = Lock()
+
+    def restore(self, session_id: str, todos: list[TodoItem]) -> None:
+        """装载调用方已读取的会话快照，保留原有待办 ID。"""
+        with self._lock:
+            items = {key: entry for key, entry in self._items.items() if entry[0] != session_id}
+            for todo in todos:
+                todo_id = todo["id"]
+                if todo_id in items:
+                    raise ToolError("todo_id_conflict", "恢复的待办 ID 已存在。")
+                items[todo_id] = (session_id, todo.copy())
+            self._items = items
 
     def list(self, session_id: str) -> list[TodoItem]:
         with self._lock:
@@ -77,6 +91,21 @@ class TodoStore:
             self._items[todo_id] = expected
 
     def _write(self, todo_id: str, expected: tuple[str, TodoItem] | None) -> bool:
+        if self._commit is not None:
+            staged = self._items.copy()
+            if expected is None:
+                owner, _ = staged.pop(todo_id)
+            else:
+                owner, _ = expected
+                staged[todo_id] = expected
+            todos = [item.copy() for session_id, item in staged.values() if session_id == owner]
+            previous = [
+                item.copy() for session_id, item in self._items.values() if session_id == owner
+            ]
+            recovered = self._commit(owner, previous, todos)
+            self._items = staged
+            return recovered
+
         try:
             self._apply(todo_id, expected)
         except Exception:
