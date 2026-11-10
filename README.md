@@ -108,6 +108,12 @@ Todo 写入后，Runtime 读回会话 JSON 核查。确认已写入时可以继�
 - Mock Search 查询固定模拟数据，结果带 `mock: true`。
 - Trace 默认只写到输出流，需显式重定向才能留档。
 
+## 架构设计笔试
+
+除最小可用 Agent 实现外，笔试还包含五个独立架构设计问题：
+
+[查看五道架构设计题解](docs/architecture-questions.md)
+
 ## 文档索引
 
 - [需求规格](docs/01-requirements.md) · [系统架构](docs/02-design.md) · [任务与验收标准](docs/03-tasks.md) · [架构决策](docs/04-decisions.md)
