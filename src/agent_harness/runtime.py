@@ -98,11 +98,12 @@ class Runtime:
 
     def run(self, message: str, session_id: str) -> RuntimeResult:
         """使用调用方提供的可信会话标识处理一条消息。"""
-        trace = RequestTrace(session_id)
-        trace.emit("request_started")
+        # A persisted session ID is safe to log after the corresponding session loads.
+        trace = RequestTrace(session_id if self._sessions is None else None)
         try:
             result = self._run_request(message, session_id, trace)
         except SessionError as exc:
+            trace.start()
             trace.emit("session_error", error_code=_session_error_code(exc))
             trace.emit(
                 "request_finished", status="failed", model_calls=trace.model_calls,
@@ -117,6 +118,7 @@ class Runtime:
 
     def _run_request(self, message: str, session_id: str, trace: RequestTrace) -> RuntimeResult:
         if len(message) > MAX_USER_CHARS:
+            trace.start()
             trace.emit("context_error", error_code="input_limit")
             return {
                 "session_id": session_id,
@@ -124,11 +126,13 @@ class Runtime:
                 "status": "failed",
             }
         if self._todos is None:
+            trace.start()
             result, _ = self._run([{"role": "user", "content": message}], session_id, trace)
             return result
         # 同一个 Runtime 串行加载和更新会话，避免覆盖另一个请求的快照。
         with self._run_lock:
             state = self.restore_session(session_id)
+            trace.start(session_id)
             try:
                 self._todos.restore(session_id, state["todos"])
             except ToolError as exc:

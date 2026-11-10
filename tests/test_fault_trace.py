@@ -1,10 +1,8 @@
-import io
 import json
 import os
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +11,6 @@ from unittest.mock import Mock, patch
 
 from openai import APIConnectionError, APITimeoutError
 
-from agent_harness import cli
 from agent_harness.config import Settings
 from agent_harness.model import Model, ModelError
 from agent_harness.runtime import Runtime
@@ -217,30 +214,18 @@ class FaultTraceTests(unittest.TestCase):
         self.assertEqual([item["error"]["code"] for item in _feedback(state)],
                          ["tool_state_uncertain", "tool_skipped"])
 
-    def _run_cli(self):
-        with (
-            patch.object(cli, "SessionStore", return_value=self.sessions),
-            patch.object(cli, "load_settings"),
-            patch.object(cli, "Model", return_value=self.model),
-            redirect_stdout(io.StringIO()) as stdout,
-            self.assertLogs("agent_harness.runtime", level="INFO") as logs,
-        ):
-            exit_code = cli.main(["--session", self.session_id, "synthetic CLI input"])
-        result = json.loads(stdout.getvalue())
-        self.assertEqual(result["session_id"], self.session_id)
-        events = _events(logs)
-        self.assertEqual(events[-1]["status"], result["status"])
-        return exit_code, result, events
-
     def test_cli_reports_model_error_after_confirmed_todo(self):
-        self.model.decide.side_effect = [
-            _batch(_todo_create("committed", "confirmed todo")), ModelError("injected model failure"),
-        ]
-        exit_code, result, events = self._run_cli()
-        self.assertEqual((exit_code, result["status"]), (1, "failed"))
+        process = self._cli_process(
+            "--trace", decisions=[_batch(_todo_create("committed", "confirmed todo"))], model_fails=True,
+        )
+        result = json.loads(process.stdout)
+        events = [json.loads(line) for line in process.stderr.splitlines()]
+        self.assertEqual((process.returncode, result["status"]), (1, "failed"))
+        self.assertEqual((events[-1]["event"], events[-1]["status"]), ("request_finished", "failed"))
+        self.assertEqual(result["session_id"], self.session_id)
         self.assertIn("未获得最终回答", result["answer"])
         self._check_tool(events, "call-1-1", "succeeded")
-        self.assertEqual(events[-2]["error_code"], "model_error")
+        self.assertEqual(events[-2]["error_code"], "model_timeout")
         self.assertEqual(events[-1]["successful_tools"], 1)
         state = self._state()
         self.assertEqual(state["todos"], [_feedback(state)[0]["result"]["todo"]])
@@ -387,7 +372,7 @@ class FaultTraceTests(unittest.TestCase):
 
     def _cli_process(self, *flags, session_id=None, model_fails=False, config_fails=False, decisions=None):
         if decisions is None:
-            decisions = [_batch(("provider-call", "calculator", {"expression": "17+25"})), _FINAL]
+            decisions = [] if model_fails else [_batch(("provider-call", "calculator", {"expression": "17+25"})), _FINAL]
         script = f"""
 from unittest.mock import Mock, patch
 from agent_harness import cli
@@ -396,7 +381,7 @@ from agent_harness.model import ModelError
 
 model = Mock()
 model_failure = ModelError("private response body", code="model_timeout")
-model.decide.side_effect = model_failure if {model_fails!r} else {decisions!r}
+model.decide.side_effect = [*{decisions!r}, *([model_failure] if {model_fails!r} else [])]
 config_failure = ConfigError("synthetic credential and C:/private/sessions")
 with (
     patch.object(cli, "load_settings", side_effect=config_failure if {config_fails!r} else None),
@@ -450,6 +435,18 @@ with (
         self.assertEqual(len({event["request_id"] for event in events}), 1)
         self.assertEqual(self._state(), original)
         self.assertFalse((self.directory / ("0" * 32 + ".json")).exists())
+
+    def test_cli_trace_redacts_unverified_session_identifier(self):
+        for identifier in ("SyntheticPrivateIdentifierNotForLogs", "a" * 32):
+            with self.subTest(identifier_shape=len(identifier)):
+                process = self._cli_process("--trace", session_id=identifier)
+                self.assertEqual((process.returncode, process.stdout), (1, ""))
+                self.assertNotIn(identifier, process.stderr)
+                events = [json.loads(line) for line in process.stderr.splitlines()]
+                self.assertEqual([event["event"] for event in events], [
+                    "request_started", "session_error", "request_finished",
+                ])
+                self.assertEqual({event["session_id"] for event in events}, {"[redacted]"})
 
     def test_cli_invalid_trace_usage_is_json_without_session_changes(self):
         original = self._state()

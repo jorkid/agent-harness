@@ -41,12 +41,19 @@ def _parameters(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 class RequestTrace:
-    def __init__(self, session_id: str) -> None:
-        self._session_id = safe_label(session_id)
+    def __init__(self, session_id: str | None) -> None:
+        self._session_id = safe_label(session_id) if session_id is not None else "[redacted]"
         self._request_id = uuid4().hex
         self._sequence = 0
         self.model_calls = 0
         self.successful_tools = 0
+
+    def start(self, verified_session_id: str | None = None) -> None:
+        if self._sequence:
+            return
+        if verified_session_id is not None:
+            self._session_id = safe_label(verified_session_id)
+        self.emit("request_started")
 
     def emit(self, event: str, *, tool: dict[str, Any] | None = None, **details: Any) -> None:
         self._sequence += 1

@@ -120,6 +120,47 @@ print(json.dumps(build_messages(state["messages"], "after restart",
         self.assertIn(quote, restored[0]["content"])
         self.assertIn("summary two", restored[0]["content"])
 
+    def test_hundredth_turn_reuses_preference_from_memory(self):
+        quote = "计算结果一律保留两位小数。"
+        final_request = "用计算器计算 7/2。"
+        maintenance_summaries = 0
+
+        def decide(messages, definitions=()):
+            nonlocal maintenance_summaries
+            last = messages[-1]
+            if not definitions:
+                source = json.loads(last["content"])
+                if isinstance(source, list):
+                    return _final(json.dumps([i for i, candidate in enumerate(source) if candidate == quote]))
+                maintenance_summaries += 1
+                return _final("Earlier turns contained temporary requests.")
+            if last["role"] == "tool":
+                self.assertIn(quote, messages[0]["content"])
+                value = json.loads(last["content"])["result"]["value"]
+                return _final(f"{value:.2f}")
+            if last["content"] == final_request:
+                self.assertIn(quote, messages[0]["content"])
+                self.assertNotIn(quote, [entry.get("content") for entry in messages[1:]])
+                return _tool_call("calculator", {"expression": "7/2"}, "hundredth-turn")
+            return _final("收到。")
+
+        self.model.decide.side_effect = decide
+        self.assertEqual(self.runtime.run(quote, self.session_id)["status"], "completed")
+        for turn in range(2, 100):
+            self.assertEqual(self.runtime.run(f"临时请求 {turn}", self.session_id)["status"], "completed")
+            self.assertLessEqual(len(self.sessions.load(self.session_id)["messages"]), 20)
+
+        self.assertGreater(maintenance_summaries, 1)
+        before = self.sessions.load(self.session_id)
+        self.assertEqual(before["memory"], [quote])
+        self.assertNotIn(quote, before["summary"])
+        restarted = Runtime(
+            self.model, create_default_tool_manager(),
+            sessions=SessionStore(self.directory / "sessions"),
+        )
+        result = restarted.run(final_request, self.session_id)
+        self.assertEqual((result["status"], result["answer"]), ("completed", "3.50"))
+
     def test_compacted_context_supports_todo_followup(self):
         self._seed(_history(19))
         create = _tool_call("todo", {"action": "create", "content": "write paper"}, "create")
