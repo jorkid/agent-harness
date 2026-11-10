@@ -247,15 +247,19 @@ class FaultTraceTests(unittest.TestCase):
         self.assertEqual(state["messages"][-1]["role"], "tool")
 
     def test_cli_reports_budget_exhaustion_after_confirmed_todo(self):
-        self.model.decide.side_effect = [
+        decisions = [
             _batch(_todo_create("committed", "confirmed todo")),
             *[_batch((f"list-{i}", "todo", {"action": "list"})) for i in range(6)],
             _batch(_todo_create("skipped", "must not exist")),
         ]
-        exit_code, result, events = self._run_cli()
-        self.assertEqual((exit_code, result["status"]), (1, "limit_reached"))
+        process = self._cli_process("--trace", decisions=decisions)
+        result = json.loads(process.stdout)
+        events = [json.loads(line) for line in process.stderr.splitlines()]
+        self.assertEqual((process.returncode, result["status"]), (1, "limit_reached"))
+        self.assertEqual(set(result), {"session_id", "answer", "status"})
+        self.assertEqual(result["session_id"], self.session_id)
+        self.assertEqual((events[-1]["event"], events[-1]["status"]), ("request_finished", result["status"]))
         self.assertIn("未获得最终回答", result["answer"])
-        self.assertEqual(self.model.decide.call_count, 8)
         self._check_tool(events, "call-1-1", "succeeded")
         self._check_tool(events, "call-8-1", "skipped", "limit_reached")
         self.assertEqual(events[-2]["event"], "budget_exhausted")
@@ -381,8 +385,9 @@ class FaultTraceTests(unittest.TestCase):
         self.assertEqual([message["tool_call_id"] for message in tools],
                          [*secrets, "call-prefix-" + secrets[1]])
 
-    def _cli_process(self, *flags, session_id=None, model_fails=False, config_fails=False):
-        decision = _batch(("provider-call", "calculator", {"expression": "17+25"}))
+    def _cli_process(self, *flags, session_id=None, model_fails=False, config_fails=False, decisions=None):
+        if decisions is None:
+            decisions = [_batch(("provider-call", "calculator", {"expression": "17+25"})), _FINAL]
         script = f"""
 from unittest.mock import Mock, patch
 from agent_harness import cli
@@ -391,7 +396,7 @@ from agent_harness.model import ModelError
 
 model = Mock()
 model_failure = ModelError("private response body", code="model_timeout")
-model.decide.side_effect = model_failure if {model_fails!r} else [{decision!r}, {_FINAL!r}]
+model.decide.side_effect = model_failure if {model_fails!r} else {decisions!r}
 config_failure = ConfigError("synthetic credential and C:/private/sessions")
 with (
     patch.object(cli, "load_settings", side_effect=config_failure if {config_fails!r} else None),
@@ -432,6 +437,7 @@ with (
         self.assertEqual(_feedback(self._state()), [{"ok": True, "result": {"value": 42}}])
 
     def test_cli_trace_missing_session_has_one_structured_failure(self):
+        original = self._state()
         process = self._cli_process("--trace", session_id="0" * 32)
         self.assertEqual(process.returncode, 1)
         self.assertEqual(process.stdout, "")
@@ -442,6 +448,20 @@ with (
         self.assertEqual(events[1]["error_code"], "session_error")
         self.assertEqual(events[-1]["status"], "failed")
         self.assertEqual(len({event["request_id"] for event in events}), 1)
+        self.assertEqual(self._state(), original)
+        self.assertFalse((self.directory / ("0" * 32 + ".json")).exists())
+
+    def test_cli_invalid_trace_usage_is_json_without_session_changes(self):
+        original = self._state()
+        process = subprocess.run(
+            [sys.executable, "-B", "-m", "agent_harness.cli", "--trace", "--session"],
+            cwd=self.directory.parent, capture_output=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual((process.returncode, process.stdout), (2, ""))
+        self.assertEqual([json.loads(line) for line in process.stderr.splitlines()], [
+            {"event": "cli_error", "status": "failed", "error_code": "invalid_trace_arguments"},
+        ])
+        self.assertEqual(self._state(), original)
 
     def test_cli_without_trace_preserves_missing_session_error(self):
         process = self._cli_process(session_id="0" * 32)

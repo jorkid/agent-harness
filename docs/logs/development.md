@@ -170,3 +170,14 @@
 - **全量回归**。执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，132 项通过，耗时 72.777 秒，退出码 0。
 - **最终验收**。独立复审通过，负责人批准 T09 收尾。独立定向测试 28 项（`test_fault_trace.py`）、开发端全量测试 132 项均通过。
 - **已知限制**。同步阻塞 handler 无统一硬超时；Trace 默认不持久化，由调用方配置日志。
+
+## 2026-11-11（T10 CLI 端到端体验与演示）
+
+- **基线与范围**。HEAD `6574f66`，起始工作树干净，T09 基线 132 项。现有 CLI 支持新建会话、按 ID 读取本地 Todo、恢复会话后发送消息及 `--trace`。本轮复用已验收的入口和核心逻辑，新增 PowerShell 7 演示及独立进程覆盖。
+- **A/B 与恢复**。在临时目录调用真实 CLI 新建 A，在 A 创建“写论文”，随后新建 B 并创建“买牛奶”。A/B 会话 ID 和 Todo ID 均不同，后续进程分别读取原 Todo ID。A 的待办更新为“明天写论文”后 ID 保持，删除后 A 的待办为空，B 的完整会话状态与修改前一致。
+- **历史与 Memory**。先为 A 准备 19 条历史以触发下一条 CLI 请求的真实压缩。确定性模型返回提取与摘要结果。后续 CLI 进程中模型实际收到 A 的原 Todo 工具结果、用户原话 Memory 和摘要，A 的修改和删除后仍可从文件读回 Memory 与摘要。B 的模型输入没有 A 的 Memory。模型入口使用确定性模拟，CLI、Runtime、Session、Context 和工具执行均走生产路径。
+- **输出契约**。成功的 Todo 请求 stderr 有 5 条 JSONL 事件，同一调用关联提出、启动及成功结果，stdout 为 `session_id`、`answer`、`status`，退出码 0。预算用例在独立进程中核实第 8 次决策触顶、已有 Todo 落盘、最后一项跳过、stdout 和 Trace 的最终状态均为 `limit_reached`，退出码 1。模型失败为 `failed` 且退出码 1。不存在会话时 stdout 为空、退出码 1，已有状态保持。无效 Trace 命令输出单条 JSON 错误，退出码 2，已有状态保持。
+- **演示**。在 `docs/cli-demo.md` 提供环境激活、`.env` 配置、创建和切换、重开终端后恢复、Todo 修改与删除、Trace 和退出码示例。6 段 PowerShell 命令通过语法解析。在 PowerShell 7.6.9 用现有虚拟环境和新临时目录实跑新建与恢复 A/B，两者均返回自己的空列表，退出码 0。另验证重定向的 Trace 错误可用 `ConvertFrom-Json` 解析。真实 DeepSeek 闭环沿用 T05 的验证记录。
+- **验证与交接**。定向执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -k test_cli -v`，12 项通过，耗时 90.419 秒。全量执行 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v`，133 项通过，耗时 83.369 秒。新增 1 项并扩展既有场景，两条命令退出码均为 0。演示从同一工作目录按 ID 串行恢复，验证使用现有虚拟环境。T10 待独立验收。T11 可复用该 CLI 路径与 Trace/磁盘断言作综合验收。
+- **文档入口修复**。README 的快速开始和文档索引均通过仓库内相对路径链接到 `docs/cli-demo.md`，移除快速开始占位。已验证两个链接均指向现有演示文件，且演示内容保持原样。执行 `git diff --check` 通过。本轮变更仅涉及文档，沿用已通过的 133 项全量测试结果。T10 待定向复核。
+- **最终验收**。独立验收通过，负责人批准 T10 收尾。本次复核全量测试 133 项通过（90.123 秒，退出码 0）；定向 CLI 测试 12 项通过。演示文档 `docs/cli-demo.md` 与 README 链接就位，未改动 `src/` 生产代码。T11 可复用该 CLI 路径与 Trace/磁盘断言作综合验收。

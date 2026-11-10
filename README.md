@@ -31,7 +31,7 @@ agent-harness/
 
 ## 快速开始
 
-> 待补充：环境准备、安装依赖、运行测试等步骤。
+按 [CLI 演示](docs/cli-demo.md) 准备环境、创建与恢复会话，并查看执行 Trace。
 
 ## 文档索引
 
@@ -44,3 +44,4 @@ agent-harness/
 | [docs/04-decisions.md](docs/04-decisions.md) | 技术决策记录 |
 | [docs/05-test-plan.md](docs/05-test-plan.md) | 测试方案 |
 | [docs/06-ai-usage.md](docs/06-ai-usage.md) | AI 使用及问题解决记录 |
+| [CLI 演示](docs/cli-demo.md) | 环境配置、会话操作与 Trace 示例 |

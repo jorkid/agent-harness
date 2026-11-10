@@ -287,27 +287,38 @@ class SessionTests(unittest.TestCase):
         )
 
     def test_cli_round_trip_through_independent_processes(self) -> None:
-        # 仅替换模型入口，使用真实 CLI、Runtime、Tool Manager 和磁盘文件。
-        script = '''
+        quote = "用户约定：计算结果始终保留两位小数。"
+        summary = "A 的历史摘要"
+        # 只替换模型入口，使用真实 CLI、Runtime、Tool Manager 和磁盘文件。
+        script = f'''
 import json
 import sys
 from unittest.mock import Mock, patch
 from agent_harness import cli
-arguments = json.loads(sys.argv[3])
+arguments = json.loads(sys.argv[-1])
 model = Mock()
 decisions = iter([
-    {"kind": "tool_calls",
-     "tool_calls": [{"tool_call_id": "cli-call", "name": "todo", "arguments": arguments}],
-     "assistant_message": {"role": "assistant", "content": None,
-        "tool_calls": [{"id": "cli-call", "type": "function",
-           "function": {"name": "todo", "arguments": json.dumps(arguments)}}]}},
-    {"kind": "final", "text": "Done"},
+    {{"kind": "tool_calls",
+      "tool_calls": [{{"tool_call_id": "cli-call", "name": "todo", "arguments": arguments}}],
+      "assistant_message": {{"role": "assistant", "content": None,
+         "tool_calls": [{{"id": "cli-call", "type": "function",
+            "function": {{"name": "todo", "arguments": json.dumps(arguments)}}}}]}}}},
+    {{"kind": "final", "text": "Done"}},
+    {{"kind": "final", "text": "[0]"}},
+    {{"kind": "final", "text": {summary!r}}},
 ])
-def decide(messages, definitions):
-    if arguments["action"] == "update" and messages[-1]["role"] == "user":
-        prior = [json.loads(msg["content"]) for msg in messages if msg["role"] == "tool"]
-        assert any(result.get("result", {}).get("todo", {}).get("id") == arguments["todo_id"]
-                   for result in prior), "restarted model request did not include the original Todo result"
+def decide(messages, definitions=()):
+    if definitions and messages[-1]["role"] == "tool":
+        assert json.loads(messages[-1]["content"])["ok"]
+    if definitions and messages[-1]["role"] == "user":
+        if arguments["action"] in ("update", "delete"):
+            prior = [json.loads(msg["content"]) for msg in messages if msg["role"] == "tool"]
+            assert any(result.get("result", {{}}).get("todo", {{}}).get("id") == arguments["todo_id"]
+                       for result in prior), "original Todo missing from resumed history"
+            assert {quote!r} in messages[0]["content"]
+            assert {summary!r} in messages[0]["content"]
+        elif arguments["content"] == "买牛奶":
+            assert all({quote!r} not in msg.get("content", "") for msg in messages)
     return next(decisions)
 model.decide.side_effect = decide
 with patch.object(cli, "load_settings"), patch.object(cli, "Model", return_value=model):
@@ -323,25 +334,65 @@ with patch.object(cli, "load_settings"), patch.object(cli, "Model", return_value
                 timeout=30,
             )
             self.assertEqual(process.returncode, 0, process.stderr)
-            return json.loads(process.stdout)
+            result = json.loads(process.stdout)
+            if "--trace" in args:
+                events = [json.loads(line) for line in process.stderr.splitlines()]
+                self.assertEqual([event["event"] for event in events], [
+                    "request_started", "tool_requested", "tool_started", "tool_result", "request_finished",
+                ])
+                self.assertEqual(len({event["request_id"] for event in events}), 1)
+                self.assertEqual(len({event["tool_call_id"] for event in events[1:4]}), 1)
+                self.assertEqual((events[3]["tool_name"], events[3]["status"]), ("todo", "succeeded"))
+                self.assertEqual(events[-1]["status"], result["status"])
+            else:
+                self.assertEqual(process.stderr, "")
+            return result
+
+        def restore(session_id: str) -> list[dict]:
+            output = child("-m", "agent_harness.cli", "--session", session_id)
+            self.assertEqual(set(output), {"session_id", "todos"})
+            self.assertEqual(output["session_id"], session_id)
+            return output["todos"]
+
+        def act(session_id: str, *, trace: bool = False, **arguments) -> None:
+            flags = ("--trace",) if trace else ()
+            result = child("-c", script, *flags, "--session", session_id, json.dumps(arguments))
+            self.assertEqual(result, {"session_id": session_id, "answer": "Done", "status": "completed"})
 
         a = child("-m", "agent_harness.cli", "--new-session")["session_id"]
+        # 直接准备压缩阈值前的历史，实际压缩由下一个 CLI 进程触发。
+        self.sessions.append_messages(a, [
+            {"role": "user", "content": text}
+            for text in [quote, *(f"较早消息 {i}" for i in range(18))]
+        ])
+        act(a, trace=True, action="create", content="写论文")
+        item_a, = restore(a)
+        self.assertEqual(item_a["content"], "写论文")
+        state_a = self.sessions.load(a)
+        self.assertEqual((state_a["memory"], state_a["summary"]), ([quote], summary))
+        self.assertLessEqual(len(state_a["messages"]), 10)
+
         b = child("-m", "agent_harness.cli", "--new-session")["session_id"]
         self.assertNotEqual(a, b)
-        for session_id, content in ((a, "会话 A"), (b, "会话 B")):
-            result = child("-c", script, "--session", session_id,
-                           json.dumps({"action": "create", "content": content}))
-            self.assertEqual(result, {"session_id": session_id, "answer": "Done", "status": "completed"})
-        item_a = child("-m", "agent_harness.cli", "--session", a)["todos"][0]
-        item_b = child("-m", "agent_harness.cli", "--session", b)["todos"][0]
-        self.assertEqual(item_a["content"], "会话 A")
-        self.assertEqual(item_b["content"], "会话 B")
-        child("-c", script, "--session", a,
-              json.dumps({"action": "update", "todo_id": item_a["id"], "content": "恢复后修改"}))
-        self.assertEqual(child("-m", "agent_harness.cli", "--session", a)["todos"], [
-            {"id": item_a["id"], "content": "恢复后修改"}
-        ])
-        self.assertEqual(child("-m", "agent_harness.cli", "--session", b)["todos"], [item_b])
+        act(b, action="create", content="买牛奶")
+        item_b, = restore(b)
+        self.assertEqual(item_b["content"], "买牛奶")
+        self.assertNotEqual(item_a["id"], item_b["id"])
+        state_b = self.sessions.load(b)
+        self.assertEqual((state_b["memory"], state_b["summary"]), ([], ""))
+
+        self.assertEqual(restore(a), [item_a])
+        self.assertEqual(restore(b), [item_b])
+        self.assertEqual((self.sessions.load(a), self.sessions.load(b)), (state_a, state_b))
+
+        act(a, action="update", todo_id=item_a["id"], content="明天写论文")
+        self.assertEqual(restore(a), [{**item_a, "content": "明天写论文"}])
+        act(a, action="delete", todo_id=item_a["id"])
+        self.assertEqual(restore(a), [])
+        self.assertEqual(restore(b), [item_b])
+        final_a = self.sessions.load(a)
+        self.assertEqual((final_a["memory"], final_a["summary"]), ([quote], summary))
+        self.assertEqual(self.sessions.load(b), state_b)
 
     def test_history_followup_and_session_isolation(self) -> None:
         a, b = self.sessions.create(), self.sessions.create()
